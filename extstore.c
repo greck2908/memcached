@@ -16,6 +16,7 @@
 #include <string.h>
 #include <assert.h>
 #include "extstore.h"
+#include "config.h"
 
 // TODO: better if an init option turns this on/off.
 #ifdef EXTSTORE_DEBUG
@@ -62,6 +63,7 @@ typedef struct _store_page {
     unsigned int allocated;
     unsigned int written; /* item offsets can be past written if wbuf not flushed */
     unsigned int bucket; /* which bucket the page is linked into */
+    unsigned int free_bucket; /* which bucket this page returns to when freed */
     int fd;
     unsigned short id;
     bool active; /* actively being written to */
@@ -77,6 +79,7 @@ typedef struct {
     pthread_cond_t cond;
     obj_io *queue;
     store_engine *e;
+    unsigned int depth; // queue depth
 } store_io_thread;
 
 typedef struct {
@@ -85,7 +88,6 @@ typedef struct {
     store_engine *e;
 } store_maint_thread;
 
-/* TODO: Array of FDs for JBOD support */
 struct store_engine {
     pthread_mutex_t mutex; /* covers internal stacks and variables */
     store_page *pages; /* directly addressable page list */
@@ -95,6 +97,7 @@ struct store_engine {
     store_maint_thread *maint_thread;
     store_page *page_freelist;
     store_page **page_buckets; /* stack of pages currently allocated to each bucket */
+    store_page **free_page_buckets; /* stack of use-case isolated free pages */
     size_t page_size;
     unsigned int version; /* global version counter */
     unsigned int last_io_thread; /* round robin the IO threads */
@@ -102,6 +105,7 @@ struct store_engine {
     unsigned int page_count;
     unsigned int page_free; /* unallocated pages */
     unsigned int page_bucketcount; /* count of potential page buckets */
+    unsigned int free_page_bucketcount; /* count of free page buckets */
     unsigned int io_depth; /* FIXME: Might cache into thr struct */
     pthread_mutex_t stats_mutex;
     struct extstore_stats stats;
@@ -111,7 +115,7 @@ static _store_wbuf *wbuf_new(size_t size) {
     _store_wbuf *b = calloc(1, sizeof(_store_wbuf));
     if (b == NULL)
         return NULL;
-    b->buf = malloc(size);
+    b->buf = calloc(size, sizeof(char));
     if (b->buf == NULL) {
         free(b);
         return NULL;
@@ -123,10 +127,21 @@ static _store_wbuf *wbuf_new(size_t size) {
 }
 
 static store_io_thread *_get_io_thread(store_engine *e) {
-    int tid;
+    int tid = -1;
+    long long int low = LLONG_MAX;
     pthread_mutex_lock(&e->mutex);
-    tid = (e->last_io_thread + 1) % e->io_threadcount;
-    e->last_io_thread = tid;
+    // find smallest queue. ignoring lock since being wrong isn't fatal.
+    // TODO: if average queue depth can be quickly tracked, can break as soon
+    // as we see a thread that's less than average, and start from last_io_thread
+    for (int x = 0; x < e->io_threadcount; x++) {
+        if (e->io_threads[x].depth == 0) {
+            tid = x;
+            break;
+        } else if (e->io_threads[x].depth < low) {
+                tid = x;
+            low = e->io_threads[x].depth;
+        }
+    }
     pthread_mutex_unlock(&e->mutex);
 
     return &e->io_threads[tid];
@@ -151,6 +166,12 @@ void extstore_get_stats(void *ptr, struct extstore_stats *st) {
     st->pages_free = e->page_free;
     st->pages_used = e->page_count - e->page_free;
     pthread_mutex_unlock(&e->mutex);
+    st->io_queue = 0;
+    for (int x = 0; x < e->io_threadcount; x++) {
+        pthread_mutex_lock(&e->io_threads[x].mutex);
+        st->io_queue += e->io_threads[x].depth;
+        pthread_mutex_unlock(&e->io_threads[x].mutex);
+    }
     // calculate bytes_fragmented.
     // note that open and yet-filled pages count against fragmentation.
     st->bytes_fragmented = st->pages_used * e->page_size -
@@ -166,7 +187,7 @@ void extstore_get_page_data(void *ptr, struct extstore_stats *st) {
 }
 
 const char *extstore_err(enum extstore_res res) {
-    char *rv = "unknown error";
+    const char *rv = "unknown error";
     switch (res) {
         case EXTSTORE_INIT_BAD_WBUF_SIZE:
             rv = "page_size must be divisible by wbuf_size";
@@ -180,6 +201,9 @@ const char *extstore_err(enum extstore_res res) {
         case EXTSTORE_INIT_PAGE_WBUF_ALIGNMENT:
             rv = "page_size and wbuf_size must be divisible by 1024*1024*2";
             break;
+        case EXTSTORE_INIT_TOO_MANY_PAGES:
+            rv = "page_count must total to < 65536. Increase page_size or lower path sizes";
+            break;
         case EXTSTORE_INIT_OOM:
             rv = "failed calloc for engine";
             break;
@@ -192,11 +216,11 @@ const char *extstore_err(enum extstore_res res) {
     return rv;
 }
 
-void *extstore_init(char *fn, struct extstore_conf *cf,
+// TODO: #define's for DEFAULT_BUCKET, FREE_VERSION, etc
+void *extstore_init(struct extstore_conf_file *fh, struct extstore_conf *cf,
         enum extstore_res *res) {
     int i;
-    int fd;
-    uint64_t offset = 0;
+    struct extstore_conf_file *f = NULL;
     pthread_t thread;
 
     if (cf->page_size % cf->wbuf_size != 0) {
@@ -227,43 +251,97 @@ void *extstore_init(char *fn, struct extstore_conf *cf,
     }
 
     e->page_size = cf->page_size;
-    fd = open(fn, O_RDWR | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) {
-        *res = EXTSTORE_INIT_OPEN_FAIL;
+    uint64_t temp_page_count = 0;
+    for (f = fh; f != NULL; f = f->next) {
+        f->fd = open(f->file, O_RDWR | O_CREAT, 0644);
+        if (f->fd < 0) {
+            *res = EXTSTORE_INIT_OPEN_FAIL;
 #ifdef EXTSTORE_DEBUG
-        perror("open");
+            perror("extstore open");
 #endif
+            free(e);
+            return NULL;
+        }
+        // use an fcntl lock to help avoid double starting.
+        struct flock lock;
+        lock.l_type = F_WRLCK;
+        lock.l_start = 0;
+        lock.l_whence = SEEK_SET;
+        lock.l_len = 0;
+        if (fcntl(f->fd, F_SETLK, &lock) < 0) {
+            *res = EXTSTORE_INIT_OPEN_FAIL;
+            free(e);
+            return NULL;
+        }
+        if (ftruncate(f->fd, 0) < 0) {
+            *res = EXTSTORE_INIT_OPEN_FAIL;
+            free(e);
+            return NULL;
+        }
+
+        temp_page_count += f->page_count;
+        f->offset = 0;
+    }
+
+    if (temp_page_count >= UINT16_MAX) {
+        *res = EXTSTORE_INIT_TOO_MANY_PAGES;
         free(e);
         return NULL;
     }
+    e->page_count = temp_page_count;
 
-    e->pages = calloc(cf->page_count, sizeof(store_page));
+    e->pages = calloc(e->page_count, sizeof(store_page));
     if (e->pages == NULL) {
         *res = EXTSTORE_INIT_OOM;
-        close(fd);
+        // FIXME: loop-close. make error label
         free(e);
         return NULL;
     }
 
-    for (i = 0; i < cf->page_count; i++) {
+    // interleave the pages between devices
+    f = NULL; // start at the first device.
+    for (i = 0; i < e->page_count; i++) {
+        // find next device with available pages
+        while (1) {
+            // restart the loop
+            if (f == NULL || f->next == NULL) {
+                f = fh;
+            } else {
+                f = f->next;
+            }
+            if (f->page_count) {
+                f->page_count--;
+                break;
+            }
+        }
         pthread_mutex_init(&e->pages[i].mutex, NULL);
         e->pages[i].id = i;
-        e->pages[i].fd = fd;
-        e->pages[i].offset = offset;
+        e->pages[i].fd = f->fd;
+        e->pages[i].free_bucket = f->free_bucket;
+        e->pages[i].offset = f->offset;
         e->pages[i].free = true;
-        offset += e->page_size;
+        f->offset += e->page_size;
     }
 
-    for (i = cf->page_count-1; i > 0; i--) {
-        e->pages[i].next = e->page_freelist;
-        e->page_freelist = &e->pages[i];
+    // free page buckets allows the app to organize devices by use case
+    e->free_page_buckets = calloc(cf->page_buckets, sizeof(store_page *));
+    e->page_bucketcount = cf->page_buckets;
+
+    for (i = e->page_count-1; i > 0; i--) {
         e->page_free++;
+        if (e->pages[i].free_bucket == 0) {
+            e->pages[i].next = e->page_freelist;
+            e->page_freelist = &e->pages[i];
+        } else {
+            int fb = e->pages[i].free_bucket;
+            e->pages[i].next = e->free_page_buckets[fb];
+            e->free_page_buckets[fb] = &e->pages[i];
+        }
     }
 
     // 0 is magic "page is freed" version
     e->version = 1;
 
-    e->page_count = cf->page_count;
     // scratch data for stats. TODO: malloc failure handle
     e->stats.page_data =
         calloc(e->page_count, sizeof(struct extstore_page_data));
@@ -305,7 +383,11 @@ void *extstore_init(char *fn, struct extstore_conf *cf,
     e->maint_thread = calloc(1, sizeof(store_maint_thread));
     e->maint_thread->e = e;
     // FIXME: error handling
+    pthread_mutex_init(&e->maint_thread->mutex, NULL);
+    pthread_cond_init(&e->maint_thread->cond, NULL);
     pthread_create(&thread, NULL, extstore_maint_thread, e->maint_thread);
+
+    extstore_run_maint(e);
 
     return (void *)e;
 }
@@ -316,13 +398,25 @@ void extstore_run_maint(void *ptr) {
 }
 
 // call with *e locked
-static store_page *_allocate_page(store_engine *e, unsigned int bucket) {
+static store_page *_allocate_page(store_engine *e, unsigned int bucket,
+        unsigned int free_bucket) {
     assert(!e->page_buckets[bucket] || e->page_buckets[bucket]->allocated == e->page_size);
-    store_page *tmp = e->page_freelist;
-    E_DEBUG("EXTSTORE: allocating new page\n");
-    if (e->page_free > 0) {
-        assert(e->page_freelist != NULL);
+    store_page *tmp = NULL;
+    // if a specific free bucket was requested, check there first
+    if (free_bucket != 0 && e->free_page_buckets[free_bucket] != NULL) {
+        assert(e->page_free > 0);
+        tmp = e->free_page_buckets[free_bucket];
+        e->free_page_buckets[free_bucket] = tmp->next;
+    }
+    // failing that, try the global list.
+    if (tmp == NULL && e->page_freelist != NULL) {
+        tmp = e->page_freelist;
         e->page_freelist = tmp->next;
+    }
+    E_DEBUG("EXTSTORE: allocating new page\n");
+    // page_freelist can be empty if the only free pages are specialized and
+    // we didn't just request one.
+    if (e->page_free > 0 && tmp != NULL) {
         tmp->next = e->page_buckets[bucket];
         e->page_buckets[bucket] = tmp;
         tmp->active = true;
@@ -432,7 +526,8 @@ static void _submit_wbuf(store_engine *e, store_page *p) {
  * new page. best if used from a background thread that can harmlessly retry.
  */
 
-int extstore_write_request(void *ptr, unsigned int bucket, obj_io *io) {
+int extstore_write_request(void *ptr, unsigned int bucket,
+        unsigned int free_bucket, obj_io *io) {
     store_engine *e = (store_engine *)ptr;
     store_page *p;
     int ret = -1;
@@ -442,7 +537,7 @@ int extstore_write_request(void *ptr, unsigned int bucket, obj_io *io) {
     pthread_mutex_lock(&e->mutex);
     p = e->page_buckets[bucket];
     if (!p) {
-        p = _allocate_page(e, bucket);
+        p = _allocate_page(e, bucket, free_bucket);
     }
     pthread_mutex_unlock(&e->mutex);
     if (!p)
@@ -456,7 +551,7 @@ int extstore_write_request(void *ptr, unsigned int bucket, obj_io *io) {
             ((!p->wbuf || p->wbuf->full) && p->allocated >= e->page_size)) {
         pthread_mutex_unlock(&p->mutex);
         pthread_mutex_lock(&e->mutex);
-        _allocate_page(e, bucket);
+        _allocate_page(e, bucket, free_bucket);
         pthread_mutex_unlock(&e->mutex);
         return ret;
     }
@@ -510,7 +605,7 @@ void extstore_write(void *ptr, obj_io *io) {
 /* engine submit function; takes engine, item_io stack.
  * lock io_thread context and add stack?
  * signal io thread to wake.
- * return sucess.
+ * return success.
  */
 int extstore_submit(void *ptr, obj_io *io) {
     store_engine *e = (store_engine *)ptr;
@@ -529,6 +624,12 @@ int extstore_submit(void *ptr, obj_io *io) {
             assert(tmp != t->queue);
         }
         tmp->next = io;
+    }
+    // TODO: extstore_submit(ptr, io, count)
+    obj_io *tio = io;
+    while (tio != NULL) {
+        t->depth++;
+        tio = tio->next;
     }
     pthread_mutex_unlock(&t->mutex);
 
@@ -603,7 +704,7 @@ void extstore_close_page(void *ptr, unsigned int page_id, uint64_t page_version)
 
 /* Finds an attached wbuf that can satisfy the read.
  * Since wbufs can potentially be flushed to disk out of order, they are only
- * removed as the head of the list successfuly flushes to disk.
+ * removed as the head of the list successfully flushes to disk.
  */
 // call with *p locked
 // FIXME: protect from reading past wbuf
@@ -654,6 +755,7 @@ static void *extstore_io_thread(void *arg) {
                     break;
                 }
             }
+            me->depth -= i;
             me->queue = end->next;
             end->next = NULL;
         }
@@ -689,11 +791,24 @@ static void *extstore_io_thread(void *arg) {
                     }
                     pthread_mutex_unlock(&p->mutex);
                     if (do_op) {
+#if !defined(HAVE_PREAD) || !defined(HAVE_PREADV)
+                        // TODO: lseek offset is natively 64-bit on OS X, but
+                        // perhaps not on all platforms? Else use lseek64()
+                        ret = lseek(p->fd, p->offset + cur_io->offset, SEEK_SET);
+                        if (ret >= 0) {
+                            if (cur_io->iov == NULL) {
+                                ret = read(p->fd, cur_io->buf, cur_io->len);
+                            } else {
+                                ret = readv(p->fd, cur_io->iov, cur_io->iovcnt);
+                            }
+                        }
+#else
                         if (cur_io->iov == NULL) {
                             ret = pread(p->fd, cur_io->buf, cur_io->len, p->offset + cur_io->offset);
                         } else {
                             ret = preadv(p->fd, cur_io->iov, cur_io->iovcnt, p->offset + cur_io->offset);
                         }
+#endif
                     }
                     break;
                 case OBJ_IO_WRITE:
@@ -762,8 +877,14 @@ static void _free_page(store_engine *e, store_page *p) {
     p->closed = false;
     p->free = true;
     // add to page stack
-    p->next = e->page_freelist;
-    e->page_freelist = p;
+    // TODO: free_page_buckets first class and remove redundancy?
+    if (p->free_bucket != 0) {
+        p->next = e->free_page_buckets[p->free_bucket];
+        e->free_page_buckets[p->free_bucket] = p;
+    } else {
+        p->next = e->page_freelist;
+        e->page_freelist = p;
+    }
     e->page_free++;
     pthread_mutex_unlock(&e->mutex);
 }
@@ -795,7 +916,9 @@ static void *extstore_maint_thread(void *arg) {
 
         pthread_cond_wait(&me->cond, &me->mutex);
         pthread_mutex_lock(&e->mutex);
-        if (e->page_free == 0) {
+        // default freelist requires at least one page free.
+        // specialized freelists fall back to default once full.
+        if (e->page_free == 0 || e->page_freelist == NULL) {
             do_evict = true;
         }
         pthread_mutex_unlock(&e->mutex);
@@ -804,6 +927,7 @@ static void *extstore_maint_thread(void *arg) {
         for (i = 0; i < e->page_count; i++) {
             store_page *p = &e->pages[i];
             pthread_mutex_lock(&p->mutex);
+            pd[p->id].free_bucket = p->free_bucket;
             if (p->active || p->free) {
                 pthread_mutex_unlock(&p->mutex);
                 continue;
@@ -812,7 +936,13 @@ static void *extstore_maint_thread(void *arg) {
                 pd[p->id].version = p->version;
                 pd[p->id].bytes_used = p->bytes_used;
                 pd[p->id].bucket = p->bucket;
-                if (p->version < low_version) {
+                // low_version/low_page are only used in the eviction
+                // scenario. when we evict, it's only to fill the default page
+                // bucket again.
+                // TODO: experiment with allowing evicting up to a single page
+                // for any specific free bucket. this is *probably* required
+                // since it could cause a load bias on default-only devices?
+                if (p->free_bucket == 0 && p->version < low_version) {
                     low_version = p->version;
                     low_page = i;
                 }

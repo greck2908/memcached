@@ -27,9 +27,8 @@
 
 static pthread_cond_t maintenance_cond = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t maintenance_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t hash_items_counter_lock = PTHREAD_MUTEX_INITIALIZER;
 
-typedef  unsigned long  int  ub4;   /* unsigned 4-byte quantities */
+typedef  uint32_t  ub4;   /* unsigned 4-byte quantities */
 typedef  unsigned       char ub1;   /* unsigned 1-byte quantities */
 
 /* how many powers of 2's worth of buckets we use */
@@ -47,12 +46,8 @@ static item** primary_hashtable = 0;
  */
 static item** old_hashtable = 0;
 
-/* Number of items in the hash table. */
-static unsigned int hash_items = 0;
-
 /* Flag: Are we in the middle of expanding now? */
 static bool expanding = false;
-static bool started_expanding = false;
 
 /*
  * During expansion we migrate values with bucket granularity; this is how
@@ -144,12 +139,13 @@ static void assoc_expand(void) {
     }
 }
 
-static void assoc_start_expand(void) {
-    if (started_expanding)
-        return;
-
-    started_expanding = true;
-    pthread_cond_signal(&maintenance_cond);
+void assoc_start_expand(uint64_t curr_items) {
+    if (pthread_mutex_trylock(&maintenance_lock) == 0) {
+        if (curr_items > (hashsize(hashpower) * 3) / 2 && hashpower < HASHPOWER_MAX) {
+            pthread_cond_signal(&maintenance_cond);
+        }
+        pthread_mutex_unlock(&maintenance_lock);
+    }
 }
 
 /* Note: this isn't an assoc_update.  The key must not already exist to call this */
@@ -168,15 +164,7 @@ int assoc_insert(item *it, const uint32_t hv) {
         primary_hashtable[hv & hashmask(hashpower)] = it;
     }
 
-    pthread_mutex_lock(&hash_items_counter_lock);
-    hash_items++;
-    if (! expanding && hash_items > (hashsize(hashpower) * 3) / 2 &&
-          hashpower < HASHPOWER_MAX) {
-        assoc_start_expand();
-    }
-    pthread_mutex_unlock(&hash_items_counter_lock);
-
-    MEMCACHED_ASSOC_INSERT(ITEM_key(it), it->nkey, hash_items);
+    MEMCACHED_ASSOC_INSERT(ITEM_key(it), it->nkey);
     return 1;
 }
 
@@ -185,13 +173,10 @@ void assoc_delete(const char *key, const size_t nkey, const uint32_t hv) {
 
     if (*before) {
         item *nxt;
-        pthread_mutex_lock(&hash_items_counter_lock);
-        hash_items--;
-        pthread_mutex_unlock(&hash_items_counter_lock);
         /* The DTrace probe cannot be triggered as the last instruction
          * due to possible tail-optimization by the compiler
          */
-        MEMCACHED_ASSOC_DELETE(key, nkey, hash_items);
+        MEMCACHED_ASSOC_DELETE(key, nkey);
         nxt = (*before)->h_next;
         (*before)->h_next = 0;   /* probably pointless, but whatever. */
         *before = nxt;
@@ -258,7 +243,6 @@ static void *assoc_maintenance_thread(void *arg) {
 
         if (!expanding) {
             /* We are done expanding.. just wait for next invocation */
-            started_expanding = false;
             pthread_cond_wait(&maintenance_cond, &maintenance_lock);
             /* assoc_expand() swaps out the hash table entirely, so we need
              * all threads to not hold any references related to the hash
@@ -267,11 +251,14 @@ static void *assoc_maintenance_thread(void *arg) {
              * allow dynamic hash table expansion without causing significant
              * wait times.
              */
-            pause_threads(PAUSE_ALL_THREADS);
-            assoc_expand();
-            pause_threads(RESUME_ALL_THREADS);
+            if (do_run_maintenance_thread) {
+                pause_threads(PAUSE_ALL_THREADS);
+                assoc_expand();
+                pause_threads(RESUME_ALL_THREADS);
+            }
         }
     }
+    mutex_unlock(&maintenance_lock);
     return NULL;
 }
 
@@ -286,7 +273,7 @@ int start_assoc_maintenance_thread() {
             hash_bulk_move = DEFAULT_HASH_BULK_MOVE;
         }
     }
-    pthread_mutex_init(&maintenance_lock, NULL);
+
     if ((ret = pthread_create(&maintenance_tid, NULL,
                               assoc_maintenance_thread, NULL)) != 0) {
         fprintf(stderr, "Can't create thread: %s\n", strerror(ret));
@@ -305,3 +292,72 @@ void stop_assoc_maintenance_thread() {
     pthread_join(maintenance_tid, NULL);
 }
 
+struct assoc_iterator {
+    unsigned int bucket;
+    bool bucket_locked;
+    item *it;
+    item *next;
+};
+
+void *assoc_get_iterator(void) {
+    struct assoc_iterator *iter = calloc(1, sizeof(struct assoc_iterator));
+    if (iter == NULL) {
+        return NULL;
+    }
+    // this will hang the caller while a hash table expansion is running.
+    mutex_lock(&maintenance_lock);
+    return iter;
+}
+
+bool assoc_iterate(void *iterp, item **it) {
+    struct assoc_iterator *iter = (struct assoc_iterator *) iterp;
+    *it = NULL;
+    // - if locked bucket and next, update next and return
+    if (iter->bucket_locked) {
+        if (iter->next != NULL) {
+            iter->it = iter->next;
+            iter->next = iter->it->h_next;
+            *it = iter->it;
+        } else {
+            // unlock previous bucket, if any
+            item_unlock(iter->bucket);
+            // iterate the bucket post since it starts at 0.
+            iter->bucket++;
+            iter->bucket_locked = false;
+            *it = NULL;
+        }
+        return true;
+    }
+
+    // - loop until we hit the end or find something.
+    if (iter->bucket != hashsize(hashpower)) {
+        // - lock next bucket
+        item_lock(iter->bucket);
+        iter->bucket_locked = true;
+        // - only check the primary hash table since expand is blocked.
+        iter->it = primary_hashtable[iter->bucket];
+        if (iter->it != NULL) {
+            // - set it, next and return
+            iter->next = iter->it->h_next;
+            *it = iter->it;
+        } else {
+            // - nothing found in this bucket, try next.
+            item_unlock(iter->bucket);
+            iter->bucket_locked = false;
+            iter->bucket++;
+        }
+    } else {
+        return false;
+    }
+
+    return true;
+}
+
+void assoc_iterate_final(void *iterp) {
+    struct assoc_iterator *iter = (struct assoc_iterator *) iterp;
+    if (iter->bucket_locked) {
+        item_unlock(iter->bucket);
+    }
+    mutex_unlock(&maintenance_lock);
+    free(iter);
+}

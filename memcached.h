@@ -18,6 +18,24 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <assert.h>
+#include <grp.h>
+#include <signal.h>
+/* need this to get IOV_MAX on some platforms. */
+#ifndef __need_IOV_MAX
+#define __need_IOV_MAX
+#endif
+#include <limits.h>
+/* FreeBSD 4.x doesn't have IOV_MAX exposed. */
+#ifndef IOV_MAX
+#if defined(__FreeBSD__) || defined(__APPLE__) || defined(__GNU__)
+# define IOV_MAX 1024
+/* GNU/Hurd don't set MAXPATHLEN
+ * http://www.gnu.org/software/hurd/hurd/porting/guidelines.html#PATH_MAX_tt_MAX_PATH_tt_MAXPATHL */
+#ifndef MAXPATHLEN
+#define MAXPATHLEN 4096
+#endif
+#endif
+#endif
 
 #include "itoa_ljust.h"
 #include "protocol_binary.h"
@@ -25,47 +43,38 @@
 #include "logger.h"
 
 #ifdef EXTSTORE
-#include "extstore.h"
 #include "crc32c.h"
 #endif
 
 #include "sasl_defs.h"
+#ifdef TLS
+#include <openssl/ssl.h>
+#endif
+
+/* for NAPI pinning feature */
+#ifndef SO_INCOMING_NAPI_ID
+#define SO_INCOMING_NAPI_ID 56
+#endif
 
 /** Maximum length of a key. */
 #define KEY_MAX_LENGTH 250
 
+/** Maximum length of a uri encoded key. */
+#define KEY_MAX_URI_ENCODED_LENGTH (KEY_MAX_LENGTH  * 3 + 1)
+
 /** Size of an incr buf. */
 #define INCR_MAX_STORAGE_LEN 24
 
-#define DATA_BUFFER_SIZE 2048
+#define WRITE_BUFFER_SIZE 1024
+#define READ_BUFFER_SIZE 16384
+#define READ_BUFFER_CACHED 0
 #define UDP_READ_BUFFER_SIZE 65536
 #define UDP_MAX_PAYLOAD_SIZE 1400
 #define UDP_HEADER_SIZE 8
 #define MAX_SENDBUF_SIZE (256 * 1024 * 1024)
-/* Up to 3 numbers (2 32bit, 1 64bit), spaces, newlines, null 0 */
-#define SUFFIX_SIZE 50
-
-/** Initial size of list of items being returned by "get". */
-#define ITEM_LIST_INITIAL 200
-
-/** Initial size of list of CAS suffixes appended to "gets" lines. */
-#define SUFFIX_LIST_INITIAL 100
-
-/** Initial size of the sendmsg() scatter/gather array. */
-#define IOV_LIST_INITIAL 400
-
-/** Initial number of sendmsg() argument structures to allocate. */
-#define MSG_LIST_INITIAL 10
-
-/** High water marks for buffer shrinking */
-#define READ_BUFFER_HIGHWAT 8192
-#define ITEM_LIST_HIGHWAT 400
-#define IOV_LIST_HIGHWAT 600
-#define MSG_LIST_HIGHWAT 100
 
 /* Binary protocol stuff */
-#define MIN_BIN_PKT_LENGTH 16
-#define BIN_PKT_HDR_WORDS (MIN_BIN_PKT_LENGTH/sizeof(uint32_t))
+#define BIN_MAX_EXTLEN 20 // length of the _incr command is currently the longest.
 
 /* Initial power multiplier for the hash table */
 #define HASHPOWER_DEFAULT 16
@@ -77,6 +86,13 @@
  * items.
  */
 #define ITEM_UPDATE_INTERVAL 60
+
+/*
+ * Valid range of the maximum size of an item, in bytes.
+ */
+#define ITEM_SIZE_MAX_LOWER_LIMIT 1024
+#define ITEM_SIZE_MAX_UPPER_LIMIT 1024 * 1024 * 1024
+
 
 /* unistd.h is here */
 #if HAVE_UNISTD_H
@@ -112,11 +128,12 @@
          + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
 
 #define ITEM_data(item) ((char*) &((item)->data) + (item)->nkey + 1 \
-         + (item)->nsuffix \
+         + (((item)->it_flags & ITEM_CFLAGS) ? sizeof(uint32_t) : 0) \
          + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
 
 #define ITEM_ntotal(item) (sizeof(struct _stritem) + (item)->nkey + 1 \
-         + (item)->nsuffix + (item)->nbytes \
+         + (item)->nbytes \
+         + (((item)->it_flags & ITEM_CFLAGS) ? sizeof(uint32_t) : 0) \
          + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
 
 #define ITEM_clsid(item) ((item)->slabs_clsid & ~(3<<6))
@@ -139,6 +156,17 @@
 /** Common APPEND_NUM_FMT_STAT format. */
 #define APPEND_NUM_STAT(num, name, fmt, val) \
     APPEND_NUM_FMT_STAT("%d:%s", num, name, fmt, val)
+
+/** Item client flag conversion */
+#define FLAGS_CONV(it, flag) { \
+    if ((it)->it_flags & ITEM_CFLAGS) { \
+        flag = *((uint32_t *)ITEM_suffix((it))); \
+    } else { \
+        flag = 0; \
+    } \
+}
+
+#define FLAGS_SIZE(item) (((item)->it_flags & ITEM_CFLAGS) ? sizeof(uint32_t) : 0)
 
 /**
  * Callback for any function producing stats.
@@ -172,6 +200,7 @@ enum conn_states {
     conn_mwrite,     /**< writing out many items sequentially */
     conn_closed,     /**< connection is closed */
     conn_watch,      /**< held by the logger thread as a watcher */
+    conn_io_queue,   /**< wait on async. process to get response object */
     conn_max_state   /**< Max state value (used for assertion) */
 };
 
@@ -207,6 +236,12 @@ enum pause_thread_types {
     PAUSE_ALL_THREADS,
     RESUME_ALL_THREADS,
     RESUME_WORKER_THREADS
+};
+
+enum stop_reasons {
+    NOT_STOP,
+    GRACE_STOP,
+    EXIT_NORMALLY
 };
 
 #define IS_TCP(x) (x == tcp_transport)
@@ -263,17 +298,24 @@ struct slab_stats {
     X(incr_misses) \
     X(decr_misses) \
     X(cas_misses) \
+    X(meta_cmds) \
     X(bytes_read) \
     X(bytes_written) \
     X(flush_cmds) \
     X(conn_yields) /* # of yields for connections (-R option)*/ \
     X(auth_cmds) \
     X(auth_errors) \
-    X(idle_kicks) /* idle connections killed */
+    X(idle_kicks) /* idle connections killed */ \
+    X(response_obj_oom) \
+    X(response_obj_count) \
+    X(response_obj_bytes) \
+    X(read_buf_oom)
 
 #ifdef EXTSTORE
 #define EXTSTORE_THREAD_STATS_FIELDS \
     X(get_extstore) \
+    X(get_aborted_extstore) \
+    X(get_oom_extstore) \
     X(recache_from_extstore) \
     X(miss_from_extstore) \
     X(badcrc_from_extstore)
@@ -292,6 +334,9 @@ struct thread_stats {
 #undef X
     struct slab_stats slab_stats[MAX_NUMBER_OF_SLAB_CLASSES];
     uint64_t lru_hits[POWER_LARGEST];
+    uint64_t read_buf_count;
+    uint64_t read_buf_bytes;
+    uint64_t read_buf_bytes_free;
 };
 
 /**
@@ -322,7 +367,13 @@ struct stats {
     uint64_t      extstore_compact_rescues; /* items re-written during compaction */
     uint64_t      extstore_compact_skipped; /* unhit items skipped during compaction */
 #endif
+#ifdef TLS
+    uint64_t      ssl_handshake_errors; /* TLS failures at accept/handshake time */
+    uint64_t      ssl_new_sessions; /* successfully negotiated new (non-reused) TLS sessions */
+#endif
     struct timeval maxconns_entered;  /* last time maxconns entered */
+    uint64_t      unexpected_napi_ids;  /* see doc/napi_ids.txt */
+    uint64_t      round_robin_fallback; /* see doc/napi_ids.txt */
 };
 
 /**
@@ -360,6 +411,7 @@ struct settings {
     uint64_t oldest_cas; /* ignore existing items with CAS values lower than this */
     int evict_to_free;
     char *socketpath;   /* path to unix socket if using local socket */
+    char *auth_file;    /* path to user authentication file */
     int access;  /* access mask (a la chmod) for unix domain socket */
     double factor;          /* chunk size growth factor */
     int chunk_size;
@@ -375,6 +427,7 @@ struct settings {
     int item_size_max;        /* Maximum item size */
     int slab_chunk_size_max;  /* Upper end for chunks within slab pages. */
     int slab_page_size;     /* Slab's page units. */
+    volatile sig_atomic_t sig_hup;  /* a HUP signal was received but not yet handled */
     bool sasl;              /* SASL on/off */
     bool maxconns_fast;     /* Whether or not to early close connections */
     bool lru_crawler;        /* Whether or not to enable the autocrawler thread */
@@ -397,15 +450,18 @@ struct settings {
     double hot_max_factor; /* HOT tail age relative to COLD tail */
     double warm_max_factor; /* WARM tail age relative to COLD tail */
     int crawls_persleep; /* Number of LRU crawls to run before sleeping */
-    bool inline_ascii_response; /* pre-format the VALUE line for ASCII responses */
     bool temp_lru; /* TTL < temporary_ttl uses TEMP_LRU */
     uint32_t temporary_ttl; /* temporary LRU threshold */
     int idle_timeout;       /* Number of seconds to let connections idle */
     unsigned int logger_watcher_buf_size; /* size of logger's per-watcher buffer */
     unsigned int logger_buf_size; /* size of per-thread logger buffer */
+    unsigned int read_buf_mem_limit; /* total megabytes allowable for net buffers */
     bool drop_privileges;   /* Whether or not to drop unnecessary process privileges */
+    bool watch_enabled; /* allows watch commands to be dropped */
     bool relaxed_privileges;   /* Relax process restrictions when running testapp */
 #ifdef EXTSTORE
+    unsigned int ext_io_threadcount; /* number of IO threads to run. */
+    unsigned int ext_page_size; /* size in megabytes of storage pages. */
     unsigned int ext_item_size; /* minimum size of items to store externally */
     unsigned int ext_item_age; /* max age of tail item before storing ext. */
     unsigned int ext_low_ttl; /* remaining TTL below this uses own pages */
@@ -419,6 +475,21 @@ struct settings {
     /* per-slab-class free chunk limit */
     unsigned int ext_free_memchunks[MAX_NUMBER_OF_SLAB_CLASSES];
 #endif
+#ifdef TLS
+    bool ssl_enabled; /* indicates whether SSL is enabled */
+    SSL_CTX *ssl_ctx; /* holds the SSL server context which has the server certificate */
+    char *ssl_chain_cert; /* path to the server SSL chain certificate */
+    char *ssl_key; /* path to the server key */
+    int ssl_verify_mode; /* client certificate verify mode */
+    int ssl_keyformat; /* key format , defult is PEM */
+    char *ssl_ciphers; /* list of SSL ciphers */
+    char *ssl_ca_cert; /* certificate with CAs. */
+    rel_time_t ssl_last_cert_refresh_time; /* time of the last server certificate refresh */
+    unsigned int ssl_wbuf_size; /* size of the write buffer used by ssl_sendmsg method */
+    bool ssl_session_cache; /* enable SSL server session caching */
+#endif
+    int num_napi_ids;   /* maximum number of NAPI IDs */
+    char *memory_file;  /* warm restart memory file path */
 };
 
 extern struct stats stats;
@@ -439,10 +510,16 @@ extern struct settings settings;
 /* If an item's storage are chained chunks. */
 #define ITEM_CHUNKED 32
 #define ITEM_CHUNK 64
-#ifdef EXTSTORE
 /* ITEM_data bulk is external to item */
 #define ITEM_HDR 128
-#endif
+/* additional 4 bytes for item client flags */
+#define ITEM_CFLAGS 256
+/* item has sent out a token already */
+#define ITEM_TOKEN_SENT 512
+/* reserved, in case tokens should be a 2-bit count in future */
+#define ITEM_TOKEN_RESERVED 1024
+/* if item has been marked as a stale value */
+#define ITEM_STALE 2048
 
 /**
  * Structure for storing items within memcached.
@@ -457,8 +534,7 @@ typedef struct _stritem {
     rel_time_t      exptime;    /* expire time */
     int             nbytes;     /* size of data */
     unsigned short  refcount;
-    uint8_t         nsuffix;    /* length of flags-and-length string */
-    uint8_t         it_flags;   /* ITEM_* above */
+    uint16_t        it_flags;   /* ITEM_* above */
     uint8_t         slabs_clsid;/* which slab class we're in */
     uint8_t         nkey;       /* key length, w/terminating null and padding */
     /* this odd type prevents type-punning issues when we do
@@ -486,8 +562,7 @@ typedef struct {
     rel_time_t      exptime;    /* expire time */
     int             nbytes;     /* size of data */
     unsigned short  refcount;
-    uint8_t         nsuffix;    /* length of flags-and-length string */
-    uint8_t         it_flags;   /* ITEM_* above */
+    uint16_t        it_flags;   /* ITEM_* above */
     uint8_t         slabs_clsid;/* which slab class we're in */
     uint8_t         nkey;       /* key length, w/terminating null and padding */
     uint32_t        remaining;  /* Max keys to crawl per slab per invocation */
@@ -505,11 +580,29 @@ typedef struct _strchunk {
     int              used;      /* chunk space used */
     int              nbytes;    /* used. */
     unsigned short   refcount;  /* used? */
-    uint8_t          orig_clsid; /* For obj hdr chunks slabs_clsid is fake. */
-    uint8_t          it_flags;  /* ITEM_* above. */
+    uint16_t         it_flags;  /* ITEM_* above. */
     uint8_t          slabs_clsid; /* Same as above. */
+    uint8_t          orig_clsid; /* For obj hdr chunks slabs_clsid is fake. */
     char data[];
 } item_chunk;
+
+#ifdef NEED_ALIGN
+static inline char *ITEM_schunk(item *it) {
+    int offset = it->nkey + 1
+        + ((it->it_flags & ITEM_CFLAGS) ? sizeof(uint32_t) : 0)
+        + ((it->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0);
+    int remain = offset % 8;
+    if (remain != 0) {
+        offset += 8 - remain;
+    }
+    return ((char *) &(it->data)) + offset;
+}
+#else
+#define ITEM_schunk(item) ((char*) &((item)->data) + (item)->nkey + 1 \
+         + (((item)->it_flags & ITEM_CFLAGS) ? sizeof(uint32_t) : 0) \
+         + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
+#endif
+
 #ifdef EXTSTORE
 typedef struct {
     unsigned int page_version; /* from IO header */
@@ -517,6 +610,7 @@ typedef struct {
     unsigned short page_id; /* from IO header */
 } item_hdr;
 #endif
+typedef struct _mc_resp_bundle mc_resp_bundle;
 typedef struct {
     pthread_t thread_id;        /* unique ID of this thread */
     struct event_base *base;    /* libevent handle this thread uses */
@@ -525,36 +619,120 @@ typedef struct {
     int notify_send_fd;         /* sending end of notify pipe */
     struct thread_stats stats;  /* Stats generated by this thread */
     struct conn_queue *new_conn_queue; /* queue of new connections to handle */
-    cache_t *suffix_cache;      /* suffix cache */
-#ifdef EXTSTORE
+    cache_t *rbuf_cache;        /* static-sized read buffers */
+    mc_resp_bundle *open_bundle;
     cache_t *io_cache;          /* IO objects */
+#ifdef EXTSTORE
     void *storage;              /* data object for storage system */
 #endif
     logger *l;                  /* logger buffer */
     void *lru_bump_buf;         /* async LRU bump buffer */
-} LIBEVENT_THREAD;
-typedef struct conn conn;
-#ifdef EXTSTORE
-typedef struct _io_wrap {
-    obj_io io;
-    struct _io_wrap *next;
-    conn *c;
-    item *hdr_it;             /* original header item. */
-    unsigned int iovec_start; /* start of the iovecs for this IO */
-    unsigned int iovec_count; /* total number of iovecs */
-    unsigned int iovec_data;  /* specific index of data iovec */
-    bool miss;                /* signal a miss to unlink hdr_it */
-    bool badcrc;              /* signal a crc failure */
-    bool active; // FIXME: canary for test. remove
-} io_wrap;
+#ifdef TLS
+    char   *ssl_wbuf;
 #endif
+    int napi_id;                /* napi id associated with this thread */
+
+} LIBEVENT_THREAD;
+
+/**
+ * Response objects
+ */
+typedef struct _io_pending_t io_pending_t;
+#define MC_RESP_IOVCOUNT 4
+typedef struct _mc_resp {
+    mc_resp_bundle *bundle; // ptr back to bundle
+    struct _mc_resp *next; // choo choo.
+    int wbytes; // bytes to write out of wbuf: might be able to nuke this.
+    int tosend; // total bytes to send for this response
+    void *write_and_free; /** free this memory after finishing writing */
+    io_pending_t *io_pending; /* pending IO descriptor for this response */
+
+    item *item; /* item associated with this response object, with reference held */
+    struct iovec iov[MC_RESP_IOVCOUNT]; /* built-in iovecs to simplify network code */
+    int chunked_total; /* total amount of chunked item data to send. */
+    uint8_t iovcnt;
+    uint8_t chunked_data_iov; /* this iov is a pointer to chunked data header */
+
+    /* instruct transmit to skip this response object. used by storage engines
+     * to asynchronously kill an object that was queued to write
+     */
+    bool skip;
+    bool free; // double free detection.
+    // UDP bits. Copied in from the client.
+    uint16_t    request_id; /* Incoming UDP request ID, if this is a UDP "connection" */
+    uint16_t    udp_sequence; /* packet counter when transmitting result */
+    uint16_t    udp_total; /* total number of packets in sequence */
+    struct sockaddr_in6 request_addr; /* udp: Who sent this request */
+    socklen_t request_addr_size;
+
+    char wbuf[WRITE_BUFFER_SIZE];
+} mc_resp;
+
+#define MAX_RESP_PER_BUNDLE ((READ_BUFFER_SIZE - sizeof(mc_resp_bundle)) / sizeof(mc_resp))
+struct _mc_resp_bundle {
+    uint8_t refcount;
+    uint8_t next_check; // next object to check on assignment.
+    struct _mc_resp_bundle *next;
+    struct _mc_resp_bundle *prev;
+    mc_resp r[];
+};
+
+typedef struct conn conn;
+
+#define IO_QUEUE_NONE 0
+#define IO_QUEUE_EXTSTORE 1
+
+typedef void (*io_queue_stack_cb)(void *ctx, void *stack);
+typedef void (*io_queue_cb)(io_pending_t *pending);
+// this structure's ownership gets passed between threads:
+// - owned normally by the worker thread.
+// - multiple queues can be submitted at the same time.
+// - each queue can be sent to different background threads.
+// - each submitted queue needs to know when to return to the worker.
+// - the worker needs to know when all queues have returned so it can process.
+//
+// io_queue_t's count field is owned by worker until submitted. Then owned by
+// side thread until returned.
+// conn->io_queues_submitted is always owned by the worker thread. it is
+// incremented as the worker submits queues, and decremented as it gets pinged
+// for returned threads.
+//
+// All of this is to avoid having to hit a mutex owned by the connection
+// thread that gets pinged for each thread (or an equivalent atomic).
+typedef struct {
+    void *ctx; // untouched ptr for specific context
+    void *stack_ctx; // module-specific context to be batch-submitted
+    io_queue_stack_cb submit_cb; // callback given a full stack of pending IO's at once.
+    io_queue_stack_cb complete_cb;
+    io_queue_cb finalize_cb; // called back on the worker thread.
+    int type;
+    int count; // ios to process before returning. only accessed by queue processor once submitted
+} io_queue_t;
+
+struct _io_pending_t {
+    io_queue_t *q;
+    conn *c;
+    mc_resp *resp; // associated response object
+    char data[120];
+};
+
 /**
  * The structure representing a connection into memcached.
  */
 struct conn {
-    int    sfd;
     sasl_conn_t *sasl_conn;
+    int    sfd;
+    bool sasl_started;
     bool authenticated;
+    bool set_stale;
+    bool mset_res; /** uses mset format for return code */
+    bool close_after_write; /** flush write then move to close connection */
+    bool rbuf_malloced; /** read buffer was malloc'ed for ascii mget, needs free() */
+#ifdef TLS
+    SSL    *ssl;
+    char   *ssl_wbuf;
+    bool ssl_enabled;
+#endif
     enum conn_states  state;
     enum bin_substates substate;
     rel_time_t last_cmd_time;
@@ -567,18 +745,10 @@ struct conn {
     int    rsize;   /** total allocated size of rbuf */
     int    rbytes;  /** how much data, starting from rcur, do we have unparsed */
 
-    char   *wbuf;
-    char   *wcurr;
-    int    wsize;
-    int    wbytes;
-    /** which state to go into after finishing current write */
-    enum conn_states  write_and_go;
-    void   *write_and_free; /** free this memory after finishing writing */
-
+    mc_resp *resp; // tail response.
+    mc_resp *resp_head; // first response in current stack.
     char   *ritem;  /** when we read in an item's value, it goes here */
     int    rlbytes;
-
-    /* data for the nread state */
 
     /**
      * item is used to hold an item structure created after reading the command
@@ -591,31 +761,10 @@ struct conn {
     /* data for the swallow state */
     int    sbytes;    /* how many bytes to swallow */
 
-    /* data for the mwrite state */
-    struct iovec *iov;
-    int    iovsize;   /* number of elements allocated in iov[] */
-    int    iovused;   /* number of elements used in iov[] */
-
-    struct msghdr *msglist;
-    int    msgsize;   /* number of elements allocated in msglist[] */
-    int    msgused;   /* number of elements used in msglist[] */
-    int    msgcurr;   /* element in msglist[] being transmitted now */
-    int    msgbytes;  /* number of bytes in current msg */
-
-    item   **ilist;   /* list of items to write out */
-    int    isize;
-    item   **icurr;
-    int    ileft;
-
-    char   **suffixlist;
-    int    suffixsize;
-    char   **suffixcurr;
-    int    suffixleft;
+    int io_queues_submitted; /* see notes on io_queue_t */
+    io_queue_t io_queues[3]; /* set of deferred IO queues. */
 #ifdef EXTSTORE
-    int io_wrapleft;
     unsigned int recache_counter;
-    io_wrap *io_wraplist; /* linked list of io_wraps */
-    bool io_queued; /* FIXME: debugging flag */
 #endif
     enum protocol protocol;   /* which protocol this connection speaks */
     enum network_transport transport; /* what transport is used by this connection */
@@ -624,8 +773,6 @@ struct conn {
     int    request_id; /* Incoming UDP request ID, if this is a UDP "connection" */
     struct sockaddr_in6 request_addr; /* udp: Who sent the most recent request */
     socklen_t request_addr_size;
-    unsigned char *hdrbuf; /* udp packet headers */
-    int    hdrsize;   /* number of headers' worth of space is allocated */
 
     bool   noreply;   /* True if the reply should not be sent. */
     /* current stats command */
@@ -644,6 +791,10 @@ struct conn {
     int keylen;
     conn   *next;     /* Used for generating a list of conn structures */
     LIBEVENT_THREAD *thread; /* Pointer to the thread object serving this connection */
+    int (*try_read_command)(conn *c); /* pointer for top level input parser */
+    ssize_t (*read)(conn  *c, void *buf, size_t count);
+    ssize_t (*sendmsg)(conn *c, struct msghdr *msg, int flags);
+    ssize_t (*write)(conn *c, void *buf, size_t count);
 };
 
 /* array of conn structures, indexed by file descriptor */
@@ -669,6 +820,7 @@ struct slab_rebalance {
     uint32_t busy_deletes;
     uint32_t busy_loops;
     uint8_t done;
+    uint8_t *completed;
 };
 
 extern struct slab_rebalance slab_rebal;
@@ -682,16 +834,21 @@ void do_accept_new_conns(const bool do_accept);
 enum delta_result_type do_add_delta(conn *c, const char *key,
                                     const size_t nkey, const bool incr,
                                     const int64_t delta, char *buf,
-                                    uint64_t *cas, const uint32_t hv);
+                                    uint64_t *cas, const uint32_t hv,
+                                    item **it_ret);
 enum store_item_type do_store_item(item *item, int comm, conn* c, const uint32_t hv);
-conn *conn_new(const int sfd, const enum conn_states init_state, const int event_flags, const int read_buffer_size, enum network_transport transport, struct event_base *base);
+void conn_io_queue_add(conn *c, int type, void *ctx, io_queue_stack_cb cb, io_queue_stack_cb com_cb, io_queue_cb fin_cb);
+io_queue_t *conn_io_queue_get(conn *c, int type);
+conn *conn_new(const int sfd, const enum conn_states init_state, const int event_flags, const int read_buffer_size,
+    enum network_transport transport, struct event_base *base, void *ssl);
+
 void conn_worker_readd(conn *c);
 extern int daemonize(int nochdir, int noclose);
 
 #define mutex_lock(x) pthread_mutex_lock(x)
 #define mutex_unlock(x) pthread_mutex_unlock(x)
 
-#include "stats.h"
+#include "stats_prefix.h"
 #include "slabs.h"
 #include "assoc.h"
 #include "items.h"
@@ -708,22 +865,23 @@ extern int daemonize(int nochdir, int noclose);
  */
 void memcached_thread_init(int nthreads, void *arg);
 void redispatch_conn(conn *c);
-void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags, int read_buffer_size, enum network_transport transport);
+void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags, int read_buffer_size,
+    enum network_transport transport, void *ssl);
 void sidethread_conn_close(conn *c);
 
 /* Lock wrappers for cache functions that are called from main loop. */
 enum delta_result_type add_delta(conn *c, const char *key,
-                                 const size_t nkey, const int incr,
+                                 const size_t nkey, bool incr,
                                  const int64_t delta, char *buf,
                                  uint64_t *cas);
 void accept_new_conns(const bool do_accept);
-conn *conn_from_freelist(void);
-bool  conn_add_to_freelist(conn *c);
 void  conn_close_idle(conn *c);
+void  conn_close_all(void);
 item *item_alloc(char *key, size_t nkey, int flags, rel_time_t exptime, int nbytes);
 #define DO_UPDATE true
 #define DONT_UPDATE false
 item *item_get(const char *key, const size_t nkey, conn *c, const bool do_update);
+item *item_get_locked(const char *key, const size_t nkey, conn *c, const bool do_update, uint32_t *hv);
 item *item_touch(const char *key, const size_t nkey, uint32_t exptime, conn *c);
 int   item_link(item *it);
 void  item_remove(item *it);
@@ -735,10 +893,14 @@ void *item_trylock(uint32_t hv);
 void item_trylock_unlock(void *arg);
 void item_unlock(uint32_t hv);
 void pause_threads(enum pause_thread_types type);
+void stop_threads(void);
+int stop_conn_timeout_thread(void);
 #define refcount_incr(it) ++(it->refcount)
 #define refcount_decr(it) --(it->refcount)
 void STATS_LOCK(void);
 void STATS_UNLOCK(void);
+#define THR_STATS_LOCK(c) pthread_mutex_lock(&c->thread->stats.mutex)
+#define THR_STATS_UNLOCK(c) pthread_mutex_unlock(&c->thread->stats.mutex)
 void threadlocal_stats_reset(void);
 void threadlocal_stats_aggregate(struct thread_stats *stats);
 void slab_stats_aggregate(struct thread_stats *stats, struct slab_stats *out);
@@ -749,9 +911,45 @@ void append_stat(const char *name, ADD_STAT add_stats, conn *c,
 
 enum store_item_type store_item(item *item, int comm, conn *c);
 
+/* Protocol related code */
+void out_string(conn *c, const char *str);
+#define REALTIME_MAXDELTA 60*60*24*30
+/* Negative exptimes can underflow and end up immortal. realtime() will
+   immediately expire values that are greater than REALTIME_MAXDELTA, but less
+   than process_started, so lets aim for that. */
+#define EXPTIME_TO_POSITIVE_TIME(exptime) (exptime < 0) ? \
+        REALTIME_MAXDELTA + 1 : exptime
+rel_time_t realtime(const time_t exptime);
+item* limited_get(char *key, size_t nkey, conn *c, uint32_t exptime, bool should_touch, bool do_update, bool *overflow);
+item* limited_get_locked(char *key, size_t nkey, conn *c, bool do_update, uint32_t *hv, bool *overflow);
+// Read/Response object handlers.
+void resp_reset(mc_resp *resp);
+void resp_add_iov(mc_resp *resp, const void *buf, int len);
+void resp_add_chunked_iov(mc_resp *resp, const void *buf, int len);
+bool resp_start(conn *c);
+mc_resp* resp_finish(conn *c, mc_resp *resp);
+bool resp_has_stack(conn *c);
+bool rbuf_switch_to_malloc(conn *c);
+void conn_release_items(conn *c);
+void conn_set_state(conn *c, enum conn_states state);
+void out_of_memory(conn *c, char *ascii_error);
+void out_errstring(conn *c, const char *str);
+void write_and_free(conn *c, char *buf, int bytes);
+void server_stats(ADD_STAT add_stats, conn *c);
+void append_stats(const char *key, const uint16_t klen,
+                  const char *val, const uint32_t vlen,
+                  const void *cookie);
+/** Return a datum for stats in binary protocol */
+bool get_stats(const char *stat_type, int nkey, ADD_STAT add_stats, void *c);
+void stats_reset(void);
+void process_stat_settings(ADD_STAT add_stats, void *c);
+void process_stats_conns(ADD_STAT add_stats, void *c);
+
 #if HAVE_DROP_PRIVILEGES
+extern void setup_privilege_violations_handler(void);
 extern void drop_privileges(void);
 #else
+#define setup_privilege_violations_handler()
 #define drop_privileges()
 #endif
 

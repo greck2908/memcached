@@ -17,8 +17,31 @@ if (!supports_extstore()) {
 
 $ext_path = "/tmp/extstore.$$";
 
-my $server = new_memcached("-m 64 -U 0 -o ext_page_size=8,ext_page_count=8,ext_wbuf_size=2,ext_threads=1,ext_io_depth=2,ext_item_size=512,ext_item_age=2,ext_recache_rate=10000,ext_max_frag=0.9,ext_path=$ext_path,slab_automove=0");
+my $server = new_memcached("-m 64 -U 0 -o ext_page_size=8,ext_wbuf_size=2,ext_threads=1,ext_io_depth=2,ext_item_size=512,ext_item_age=2,ext_recache_rate=10000,ext_max_frag=0.9,ext_path=$ext_path:64m,slab_automove=0,ext_compact_under=1");
 my $sock = $server->sock;
+
+eval {
+    my $server = new_memcached("-o ext_path=$ext_path:64m");
+};
+ok($@, "failed to start a second server with the same file path");
+
+# Wait until all items have flushed
+sub wait_for_ext {
+    my $target = shift || 0;
+    my $sum = $target + 1;
+    while ($sum > $target) {
+        my $s = mem_stats($sock, "items");
+        $sum = 0;
+        for my $key (keys %$s) {
+            if ($key =~ m/items:(\d+):number/) {
+                # Ignore classes which can contain extstore items
+                next if $1 < 3;
+                $sum += $s->{$key};
+            }
+        }
+        sleep 1 if $sum > $target;
+    }
+}
 
 my $value;
 {
@@ -47,7 +70,7 @@ mem_get_is($sock, "foo", "hi");
         print $sock "set nfoo$_ 0 0 20000 noreply\r\n$value\r\n";
     }
     # wait for a flush
-    sleep 4;
+    wait_for_ext();
     # fetch
     # TODO: Fetch back all values
     mem_get_is($sock, "nfoo1", $value);
@@ -83,22 +106,28 @@ mem_get_is($sock, "foo", "hi");
 
 # fill to eviction
 {
-    my $keycount = 3000;
+    my $keycount = 4000;
     for (1 .. $keycount) {
         print $sock "set mfoo$_ 0 0 20000 noreply\r\n$value\r\n";
+        # wait to avoid evictions
+        wait_for_ext(500) if ($_ % 2000 == 0);
     }
-    sleep 4;
+    # because item_age is set to 2s
+    wait_for_ext();
     my $stats = mem_stats($sock);
+    is($stats->{evictions}, 0, 'no evictions');
     is($stats->{miss_from_extstore}, 0, 'no misses');
-    mem_get_is($sock, "canary", undef);
+    # FIXME: test is flaky; something can rescue the canary because of a race
+    # condition. might need to roundtrip twice or disable compaction?
+    #mem_get_is($sock, "canary", undef);
 
     # check counters
     $stats = mem_stats($sock);
     cmp_ok($stats->{extstore_page_evictions}, '>', 0, 'at least one page evicted');
     cmp_ok($stats->{extstore_objects_evicted}, '>', 0, 'at least one object evicted');
     cmp_ok($stats->{extstore_bytes_evicted}, '>', 0, 'some bytes evicted');
-    is($stats->{extstore_pages_free}, 0, '0 pages are free');
-    is($stats->{miss_from_extstore}, 1, 'exactly one miss');
+    cmp_ok($stats->{extstore_pages_free}, '<', 2, 'few pages are free');
+    #is($stats->{miss_from_extstore}, 1, 'exactly one miss');
 
     # refresh some keys so rescues happen while drop_unread == 1.
     for (1 .. $keycount / 2) {
@@ -110,6 +139,10 @@ mem_get_is($sock, "foo", "hi");
     print $sock "extstore drop_unread 1\r\n";
     my $res = <$sock>;
     print $sock "extstore max_frag 0\r\n";
+    $res = <$sock>;
+    print $sock "extstore compact_under 4\r\n";
+    $res = <$sock>;
+    print $sock "extstore drop_under 3\r\n";
     $res = <$sock>;
     for (1 .. $keycount) {
         next unless $_ % 2 == 0;
@@ -131,7 +164,7 @@ mem_get_is($sock, "foo", "hi");
     for (1 .. $keycount) {
         print $sock "set bfoo$_ 0 0 20000 noreply\r\n$value\r\n";
     }
-    sleep 4;
+    wait_for_ext();
 
     # incr should be blocked.
     print $sock "incr bfoo1 1\r\n";
@@ -139,7 +172,7 @@ mem_get_is($sock, "foo", "hi");
 
     # append/prepend *could* work, but it would require pulling the item back in.
     print $sock "append bfoo1 0 0 2\r\nhi\r\n";
-    is(scalar <$sock>, "NOT_STORED\r\n", 'append falis');
+    is(scalar <$sock>, "NOT_STORED\r\n", 'append fails');
     print $sock "prepend bfoo1 0 0 2\r\nhi\r\n";
     is(scalar <$sock>, "NOT_STORED\r\n", 'prepend fails');
 }

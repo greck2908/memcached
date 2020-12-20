@@ -1,6 +1,8 @@
 #ifndef CRAWLER_H
 #define CRAWLER_H
 
+#define LRU_CRAWLER_CAP_REMAINING -1
+
 typedef struct {
     uint64_t histo[61];
     uint64_t ttl_hourplus;
@@ -26,9 +28,12 @@ enum crawler_result_type {
     CRAWLER_OK=0, CRAWLER_RUNNING, CRAWLER_BADCLASS, CRAWLER_NOTSTARTED, CRAWLER_ERROR
 };
 int start_item_crawler_thread(void);
-int stop_item_crawler_thread(void);
+#define CRAWLER_WAIT true
+#define CRAWLER_NOWAIT false
+int stop_item_crawler_thread(bool wait);
 int init_lru_crawler(void *arg);
-enum crawler_result_type lru_crawler_crawl(char *slabs, enum crawler_run_type, void *c, const int sfd);
+enum crawler_result_type lru_crawler_crawl(char *slabs, enum crawler_run_type,
+        void *c, const int sfd, unsigned int remaining);
 int lru_crawler_start(uint8_t *ids, uint32_t remaining,
                              const enum crawler_run_type type, void *data,
                              void *c, const int sfd);
