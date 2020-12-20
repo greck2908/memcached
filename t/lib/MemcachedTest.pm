@@ -2,7 +2,6 @@ package MemcachedTest;
 use strict;
 use IO::Socket::INET;
 use IO::Socket::UNIX;
-use POSIX ":sys_wait_h";
 use Exporter 'import';
 use Carp qw(croak);
 use vars qw(@EXPORT);
@@ -15,47 +14,11 @@ my $builddir = getcwd;
 my @unixsockets = ();
 
 @EXPORT = qw(new_memcached sleep mem_get_is mem_gets mem_gets_is mem_stats
-             supports_sasl free_port supports_drop_priv supports_extstore
-             wait_ext_flush supports_tls enabled_tls_testing run_help
-             supports_unix_socket);
-
-use constant MAX_READ_WRITE_SIZE => 16384;
-use constant SRV_CRT => "server_crt.pem";
-use constant SRV_KEY => "server_key.pem";
-use constant CLIENT_CRT => "client_crt.pem";
-use constant CLIENT_KEY => "client_key.pem";
-use constant CA_CRT => "cacert.pem";
-
-my $testdir = $builddir . "/t/";
-my $client_crt = $testdir. CLIENT_CRT;
-my $client_key = $testdir. CLIENT_KEY;
-my $server_crt = $testdir . SRV_CRT;
-my $server_key = $testdir . SRV_KEY;
-
-my $tls_checked = 0;
+             supports_sasl free_port supports_drop_priv supports_extstore);
 
 sub sleep {
     my $n = shift;
     select undef, undef, undef, $n;
-}
-
-# Wait until all items have flushed
-sub wait_ext_flush {
-    my $sock = shift;
-    my $target = shift || 0;
-    my $sum = $target + 1;
-    while ($sum > $target) {
-        my $s = mem_stats($sock, "items");
-        $sum = 0;
-        for my $key (keys %$s) {
-            if ($key =~ m/items:(\d+):number/) {
-                # Ignore classes which can contain extstore items
-                next if $1 < 3;
-                $sum += $s->{$key};
-            }
-        }
-        sleep 1 if $sum > $target;
-    }
 }
 
 sub mem_stats {
@@ -166,114 +129,46 @@ sub free_port {
     my $port;
     while (!$sock) {
         $port = int(rand(20000)) + 30000;
-        if (enabled_tls_testing()) {
-            $sock = eval qq{ IO::Socket::SSL->new(LocalAddr => '127.0.0.1',
-                                      LocalPort => $port,
-                                      Proto     => '$type',
-                                      ReuseAddr => 1,
-                                      SSL_verify_mode => SSL_VERIFY_NONE);
-                                      };
-             die $@ if $@; # sanity check.
-        } else {
-            $sock = IO::Socket::INET->new(LocalAddr => '127.0.0.1',
+        $sock = IO::Socket::INET->new(LocalAddr => '127.0.0.1',
                                       LocalPort => $port,
                                       Proto     => $type,
                                       ReuseAddr => 1);
-        }
     }
     return $port;
 }
 
-sub print_help {
-    my $exe = get_memcached_exe();
-    my $output = `$exe -h`;
-    return $output;
-}
-
 sub supports_udp {
-    my $output = print_help();
+    my $output = `$builddir/memcached-debug -h`;
     return 0 if $output =~ /^memcached 1\.1\./;
     return 1;
 }
 
 sub supports_sasl {
-    my $output = print_help();
+    my $output = `$builddir/memcached-debug -h`;
     return 1 if $output =~ /sasl/i;
     return 0;
 }
 
 sub supports_extstore {
-    my $output = print_help();
+    my $output = `$builddir/memcached-debug -h`;
     return 1 if $output =~ /ext_path/i;
     return 0;
 }
 
-sub supports_tls {
-    my $output = print_help();
-    return 1 if $output =~ /enable-ssl/i;
-    return 0;
-}
-
-sub supports_unix_socket {
-    my $output = print_help();
-    return 1 if $output =~ /unix-socket/i;
-    return 0;
-}
-
-sub enabled_tls_testing {
-    if ($tls_checked) {
-        return 1;
-    } elsif (supports_tls() && $ENV{SSL_TEST}) {
-        eval "use IO::Socket::SSL";
-        croak("IO::Socket::SSL not installed or failed to load, cannot run SSL tests as requested") if $@;
-        $tls_checked = 1;
-        return 1;
-    }
-}
-
 sub supports_drop_priv {
-    my $output = print_help();
+    my $output = `$builddir/memcached-debug -h`;
     return 1 if $output =~ /no_drop_privileges/i;
     return 0;
-}
-
-sub get_memcached_exe {
-    my $exe = "$builddir/memcached-debug";
-    croak("memcached binary doesn't exist.  Haven't run 'make' ?\n") unless -e $exe;
-    croak("memcached binary not executable\n") unless -x _;
-    return $exe;
-}
-
-sub run_help {
-    my $exe = get_memcached_exe();
-    return system("$exe -h");
-}
-
-# -1 if the pid is actually dead.
-sub is_running {
-    return waitpid($_[0], WNOHANG) >= 0 ? 1 : 0;
 }
 
 sub new_memcached {
     my ($args, $passed_port) = @_;
     my $port = $passed_port;
     my $host = '127.0.0.1';
-    my $ssl_enabled  = enabled_tls_testing();
-    my $unix_socket_disabled  = !supports_unix_socket();
 
     if ($ENV{T_MEMD_USE_DAEMON}) {
         my ($host, $port) = ($ENV{T_MEMD_USE_DAEMON} =~ m/^([^:]+):(\d+)$/);
-        my $conn;
-        if ($ssl_enabled) {
-            $conn = eval qq{IO::Socket::SSL->new(PeerAddr => "$host:$port",
-                                        SSL_verify_mode => SSL_VERIFY_NONE,
-                                        SSL_cert_file => '$client_crt',
-                                        SSL_key_file => '$client_key');
-                                        };
-             die $@ if $@; # sanity check.
-        } else {
-            $conn = IO::Socket::INET->new(PeerAddr => "$host:$port");
-        }
+        my $conn = IO::Socket::INET->new(PeerAddr => "$host:$port");
         if ($conn) {
             return Memcached::Handle->new(conn => $conn,
                                           host => $host,
@@ -288,17 +183,12 @@ sub new_memcached {
     $args .= " -o relaxed_privileges";
 
     my $udpport;
-    if ($args =~ /-l (\S+)/ || (($ssl_enabled || $unix_socket_disabled) && ($args !~ /-s (\S+)/))) {
-        if (!$port) {
-            $port = free_port();
-        }
+    if ($args =~ /-l (\S+)/) {
+        $port = free_port();
         $udpport = free_port("udp");
         $args .= " -p $port";
-        if (supports_udp() && $args !~ /-U (\S+)/) {
+        if (supports_udp()) {
             $args .= " -U $udpport";
-        }
-        if ($ssl_enabled) {
-            $args .= " -Z -o ssl_chain_cert=$server_crt -o ssl_key=$server_key";
         }
     } elsif ($args !~ /-s (\S+)/) {
         my $num = @unixsockets;
@@ -309,63 +199,34 @@ sub new_memcached {
 
     my $childpid = fork();
 
-    my $exe = get_memcached_exe();
+    my $exe = "$builddir/memcached-debug";
+    croak("memcached binary doesn't exist.  Haven't run 'make' ?\n") unless -e $exe;
+    croak("memcached binary not executable\n") unless -x _;
 
     unless ($childpid) {
-        my $valgrind = "";
-        my $valgrind_args = "--quiet --error-exitcode=1 --exit-on-first-error=yes";
-        if ($ENV{VALGRIND_ARGS}) {
-            $valgrind_args = $ENV{VALGRIND_ARGS};
-        }
-        if ($ENV{VALGRIND_TEST}) {
-            $valgrind = "valgrind $valgrind_args";
-            # NOTE: caller file stuff.
-            $valgrind .= " $ENV{VALGRIND_EXTRA_ARGS}";
-        }
-        my $cmd = "$builddir/timedrun 600 $valgrind $exe $args";
-        #print STDERR "RUN: $cmd\n\n";
-        exec $cmd;
+        exec "$builddir/timedrun 600 $exe $args";
         exit; # never gets here.
     }
 
     # unix domain sockets
     if ($args =~ /-s (\S+)/) {
-        # A slow/emulated/valgrinded/etc system may take longer than a second
-        # for the unix socket to appear.
+        sleep 1;
         my $filename = $1;
-        for (1..20) {
-            sleep 1;
-            my $conn = IO::Socket::UNIX->new(Peer => $filename);
+        my $conn = IO::Socket::UNIX->new(Peer => $filename) ||
+            croak("Failed to connect to unix domain socket: $! '$filename'");
 
-            if ($conn) {
-                return Memcached::Handle->new(pid  => $childpid,
-                                              conn => $conn,
-                                              domainsocket => $filename,
-                                              host => $host,
-                                              port => $port);
-            } else {
-                croak("Failed to connect to unix socket: memcached not running") unless is_running($childpid);
-                sleep 1;
-            }
-        }
-        croak("Failed to connect to unix domain socket: $! '$filename'") if $@;
+        return Memcached::Handle->new(pid  => $childpid,
+                                      conn => $conn,
+                                      domainsocket => $filename,
+                                      host => $host,
+                                      port => $port);
     }
 
     # try to connect / find open port, only if we're not using unix domain
     # sockets
 
-    for (1..80) {
-        my $conn;
-        if ($ssl_enabled) {
-            $conn = eval qq{ IO::Socket::SSL->new(PeerAddr => "127.0.0.1:$port",
-                                        SSL_verify_mode => SSL_VERIFY_NONE,
-                                        SSL_cert_file => '$client_crt',
-                                        SSL_key_file => '$client_key');
-                                        };
-            die $@ if $@; # sanity check.
-        } else {
-            $conn = IO::Socket::INET->new(PeerAddr => "127.0.0.1:$port");
-        }
+    for (1..20) {
+        my $conn = IO::Socket::INET->new(PeerAddr => "127.0.0.1:$port");
         if ($conn) {
             return Memcached::Handle->new(pid  => $childpid,
                                           conn => $conn,
@@ -373,8 +234,7 @@ sub new_memcached {
                                           host => $host,
                                           port => $port);
         }
-        croak("Failed to connect: memcached not running") unless is_running($childpid);
-        select undef, undef, undef, 0.25;
+        select undef, undef, undef, 0.10;
     }
     croak("Failed to startup/connect to memcached server.");
 }
@@ -387,7 +247,6 @@ END {
 
 ############################################################################
 package Memcached::Handle;
-use POSIX ":sys_wait_h";
 sub new {
     my ($class, %params) = @_;
     return bless \%params, $class;
@@ -401,17 +260,6 @@ sub DESTROY {
 sub stop {
     my $self = shift;
     kill 15, $self->{pid};
-}
-
-sub graceful_stop {
-    my $self = shift;
-    kill 'SIGUSR1', $self->{pid};
-}
-
-# -1 if the pid is actually dead.
-sub is_running {
-    my $self = shift;
-    return waitpid($self->{pid}, WNOHANG) >= 0 ? 1 : 0;
 }
 
 sub host { $_[0]{host} }
@@ -431,16 +279,6 @@ sub new_sock {
     my $self = shift;
     if ($self->{domainsocket}) {
         return IO::Socket::UNIX->new(Peer => $self->{domainsocket});
-    } elsif (MemcachedTest::enabled_tls_testing()) {
-        my $ssl_session_cache = shift;
-        my $ssl_version = shift;
-        return eval qq{ IO::Socket::SSL->new(PeerAddr => "$self->{host}:$self->{port}",
-                                    SSL_verify_mode => IO::Socket::SSL::SSL_VERIFY_NONE,
-                                    SSL_session_cache => \$ssl_session_cache,
-                                    SSL_version => '$ssl_version',
-                                    SSL_cert_file => '$client_crt',
-                                    SSL_key_file => '$client_key');
-                                    };
     } else {
         return IO::Socket::INET->new(PeerAddr => "$self->{host}:$self->{port}");
     }

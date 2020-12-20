@@ -16,8 +16,7 @@
 struct window_data {
     uint64_t age;
     uint64_t dirty;
-    float evicted_ratio;
-    uint64_t evicted_seen; // if evictions were seen at all this window
+    uint64_t evicted;
 };
 
 typedef struct {
@@ -64,8 +63,7 @@ static void window_sum(struct window_data *wd, struct window_data *w, uint32_t s
         struct window_data *d = &wd[x];
         w->age += d->age;
         w->dirty += d->dirty;
-        w->evicted_ratio += d->evicted_ratio;
-        w->evicted_seen += d->evicted_seen;
+        w->evicted += d->evicted;
     }
 }
 
@@ -86,11 +84,6 @@ void slab_automove_run(void *arg, int *src, int *dst) {
     // fill after structs
     fill_item_stats_automove(a->iam_after);
     fill_slab_stats_automove(a->sam_after);
-    // Loop once to get total_evicted for this window.
-    uint64_t evicted_total = 0;
-    for (n = POWER_SMALLEST; n < MAX_NUMBER_OF_SLAB_CLASSES; n++) {
-        evicted_total += a->iam_after[n].evicted - a->iam_before[n].evicted;
-    }
     a->window_cur++;
 
     // iterate slabs
@@ -104,15 +97,9 @@ void slab_automove_run(void *arg, int *src, int *dst) {
 
         // if page delta, or evicted delta, mark window dirty
         // (or outofmemory)
-        uint64_t evicted_delta = a->iam_after[n].evicted - a->iam_before[n].evicted;
-        if (evicted_delta > 0) {
-            // FIXME: the python script is using floats. we have ints.
-            wd->evicted_ratio = (float) evicted_delta / evicted_total;
-            wd->evicted_seen = 1;
-            wd->dirty = 1;
-        }
-
-        if (a->iam_after[n].outofmemory - a->iam_before[n].outofmemory > 0) {
+        if (a->iam_after[n].evicted - a->iam_before[n].evicted > 0 ||
+            a->iam_after[n].outofmemory - a->iam_before[n].outofmemory > 0) {
+            wd->evicted = 1;
             wd->dirty = 1;
         }
         if (a->sam_after[n].total_pages - a->sam_before[n].total_pages > 0) {
@@ -142,12 +129,10 @@ void slab_automove_run(void *arg, int *src, int *dst) {
 
         // grab evicted count from window
         // if > half the window and youngest, mark as youngest
-        // or, if more than 25% of total evictions in the window.
-        if (age < youngest_age && (w_sum.evicted_seen > a->window_size / 2
-                    || w_sum.evicted_ratio / a->window_size > 0.25)) {
+        if (age < youngest_age && w_sum.evicted > a->window_size / 2) {
             youngest = n;
             youngest_age = age;
-            youngest_evicting = wd->evicted_seen ? true : false;
+            youngest_evicting = wd->evicted ? true : false;
         }
     }
 
